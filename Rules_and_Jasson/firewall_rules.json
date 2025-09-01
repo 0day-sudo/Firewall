@@ -1,0 +1,50 @@
+[
+  {
+    "id": 1,
+    "name": "Allow SSH from trusted network",
+    "enabled": true,
+    "priority": 100,
+    "protocol": "TCP",
+    "source_ip": "192.168.1.0/24",
+    "destination_ip": "ANY",
+    "source_port": "ANY",
+    "destination_port": "22",
+    "action": "ACCEPT"
+  },
+  {
+    "id": 2,
+    "name": "Block all outgoing ICMP",
+    "enabled": true,
+    "priority": 200,
+    "protocol": "ICMP",
+    "source_ip": "ANY",
+    "destination_ip": "ANY",
+    "source_port": "ANY",
+    "destination_port": "ANY",
+    "action": "DROP"
+  },
+  {
+    "id": 3,
+    "name": "Allow DNS queries to specific server",
+    "enabled": true,
+    "priority": 150,
+    "protocol": "UDP",
+    "source_ip": "ANY",
+    "destination_ip": "8.8.8.8",
+    "source_port": "ANY",
+    "destination_port": "53",
+    "action": "ACCEPT"
+  },
+  {
+    "id": 4,
+    "name": "Block all traffic from blacklisted IP",
+    "enabled": true,
+    "priority": 50,
+    "protocol": "ANY",
+    "source_ip": "10.0.0.5",
+    "destination_ip": "ANY",
+    "source_port": "ANY",
+    "destination_port": "ANY",
+    "action": "DROP"
+  }
+]

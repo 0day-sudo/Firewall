@@ -1,0 +1,1 @@
+gcc rules.c -o rules -lmnl -ljansson 

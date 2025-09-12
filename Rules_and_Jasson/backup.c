@@ -86,7 +86,7 @@ typedef enum {
 // struktur zum kommunizieren der threads in der sende funktion
 typedef struct {
     pthread_mutex_t mutex;
-    thread_completion_t status;
+    thread_completion status;
 } thread_result;
 
 // struktur zur ueebrgabe der argumente die die timer funktion braucht
@@ -102,7 +102,11 @@ typedef struct {
     int nl_sock;
 } recv_args;
 
-
+// verschiedene arten von ack packet antworten
+enum {
+    NL_CMD_ACK = 10,
+    NL_CMD_ERROR = 11
+};
 
 void add_rule_to_list(struct firewall_rule_format *rule_data, struct rule_node **head_from_list) {
     //reserviert zufaelligen speicher fuer eine strctur rule_node_format
@@ -714,7 +718,7 @@ void  *timer(void *arg) {
     
     // Greife auf die einzelnen Parameter über den Zeiger zu
     thread_result *result = args->result;
-    pthread_t receiver_tid = args->receiver_tid;
+    pthread_t receiver_tid = args->receiver_thread_id;
 
     // Definiere die Timeout-Zeit in Sekunden
     const int timeout_seconds = 10;
@@ -733,9 +737,9 @@ void  *timer(void *arg) {
     } while (elapsed_seconds < timeout_seconds);
 
     // Prüfen, ob das Ergebnis noch nicht gesetzt wurde
-    if (result_data.status == RESULT_NONE) {
+    if (result->status == RESULT_NONE) {
         // Der Timer hat als Erster geendet, daher setzen wir den Status auf Timeout
-        result_data.status = RESULT_TIMEOUT;
+        result->status = RESULT_TIMEOUT;
         printf("Timer-Thread: Timeout erreicht. Breche Receiver ab.\n");
         // Breche den Receiver-Thread ab, da er blockiert
         pthread_cancel(receiver_tid);
@@ -750,7 +754,7 @@ void *recv_msg(void *arg) {
     
     // Greife auf die einzelnen Parameter über den Zeiger zu
     thread_result *result = args->result;
-    pthread_t timer_tid = args->timer_tid;
+    pthread_t timer_tid = args->timer_thread_tid;
     int nl_sock = args->nl_sock;
 
     // hier wird das empfange packet 
@@ -813,7 +817,7 @@ int send_rules_to_kernel(struct rule_node **head, int nl_sock_fd, int command) {
     pthread_t recv_msg_thread;
 
     // struktur  zur kommunikation der threads
-    thread_result_t result_data_thread;
+    thread_result result_data_thread;
 
     // struktur fuer die timer argumente
     timer_args timer_args;
@@ -917,10 +921,10 @@ int send_rules_to_kernel(struct rule_node **head, int nl_sock_fd, int command) {
             pthread_join(recv_msg_thread, NULL);
 
             // auslesen der status struktur
-            if (result_data.status == RESULT_RECEIVED) {
+            if (result_data_thread.status == RESULT_RECEIVED) {
                 printf(" Ergebnis: Eine ACK-Nachricht wurde erfolgreich empfangen.\n");
                 break;
-            } else if (result_data.status == RESULT_TIMEOUT) {
+            } else if (result_data_thread.status == RESULT_TIMEOUT) {
                 printf(" Ergebnis: Timeout! Keine Nachricht wurde empfangen.\n");
                 continue;
             } else {

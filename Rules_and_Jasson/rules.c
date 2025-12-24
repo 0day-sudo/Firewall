@@ -11,7 +11,9 @@
 #include <linux/rtnetlink.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <sys/time.h>
 #include <unistd.h>
+
 
 #define MY_FIREWALL_NETLINK_PROTOCOL 31
 
@@ -40,6 +42,13 @@ typedef enum {
     FW_ACTION_UNKWON
 } fw_action_t;
 
+// Die Richtung der Regel, muss identisch zur Kernel-Definition sein
+typedef enum {
+    FW_DIR_IN = 1,  
+    FW_DIR_OUT,    
+    FW_DIR_BOTH
+} fw_direction_t;
+
 //firewallregelstruktur
 typedef struct firewall_rule_format{
     uint32_t id;
@@ -59,6 +68,7 @@ typedef struct firewall_rule_format{
     fw_port_range_t dst_port; // Host Byte Order
 
     fw_action_t action;
+
 } firewall_rule_format;
 
 //linked list
@@ -75,7 +85,37 @@ enum {
     // Füge weitere Befehle hinzu, wenn du sie brauchst (z.B. GET_RULES, STATUS_REPORT)
 };
 
+// Zustände für die Kommunikation
+typedef enum {
+    RESULT_NONE,
+    RESULT_RECEIVED,
+    RESULT_TIMEOUT
+} thread_completion;
 
+// struktur zum kommunizieren der threads in der sende funktion
+typedef struct {
+    pthread_mutex_t mutex;
+    thread_completion status;
+} thread_result;
+
+// struktur zur ueebrgabe der argumente die die timer funktion braucht
+typedef struct {
+    thread_result *result;
+    pthread_t receiver_thread_tid;
+} timer_args;
+
+// struktur zur ueebrgabe der argumente die die recv funktion braucht
+typedef struct {
+    thread_result *result;
+    pthread_t timer_thread_tid;
+    int nl_sock;
+} recv_args;
+
+// verschiedene arten von ack packet antworten
+enum {
+    NL_CMD_ACK = 10,
+    NL_CMD_ERROR = 11
+};
 
 void add_rule_to_list(struct firewall_rule_format *rule_data, struct rule_node **head_from_list) {
     //reserviert zufaelligen speicher fuer eine strctur rule_node_format
@@ -149,7 +189,7 @@ void clear_list( struct rule_node **head_from_list) {
     struct rule_node *current = *head_from_list;
     struct rule_node *nextElement = NULL;
 
-    while(current != NULL) {
+    while(current->next != NULL) {
         nextElement = current->next;
         free(current);
         current = nextElement;
@@ -333,7 +373,7 @@ void error_function(struct firewall_rule_format *new_rule, struct rule_node **he
     // Füge die Regel (auch wenn fehlerhaft) zur Liste hinzu, um alle Parsingergebnisse zu verfolgen.
         if (new_rule->result_code != PARSE_SUCCESS) {
             add_rule_to_list(new_rule, head_from_list);
-            printf("Regel %zu (ID: %u) wurde mit Fehlern geparst erfolgreich hinzugefügt.\n", i, new_rule->id);
+            printf("Regel %d (ID: %u) wurde mit Fehlern geparst erfolgreich hinzugefügt.\n", i, new_rule->id);
 
             // hier wird der genaue Fehelr identifiziert
             switch (new_rule->result_code) {
@@ -388,7 +428,7 @@ int parse_rules_json_file(const char *filename, struct rule_node **head_from_lis
     if (!root) {
         fprintf(stderr, "Fehler beim Laden der JSON-Datei '%s': %s (Zeile %d, Spalte %d)\n",
                 filename, error.text, error.line, error.column);
-        return -1; // Fehlercode bei Dateifehler zurückgeben
+        return 0; // NULL bei Dateifehler zurückgeben
     }
 
 
@@ -396,23 +436,21 @@ int parse_rules_json_file(const char *filename, struct rule_node **head_from_lis
     if (!json_is_array(root)) {
         fprintf(stderr, "Fehler: Das Root-Element der JSON-Datei ist kein Array.\n");
         json_decref(root); // JSON-Objekt freigeben
-        return -1; // Fehlercode zurückgeben, wenn es kein Array ist
+        return 0; // NULL zurückgeben, wenn es kein Array ist
     }
-    printf("moin");
+
     // Anzahl der Regeln im Array ermitteln
     size_t num_json_elements = json_array_size(root);
     printf("Starte das Parsen von %zu Regeln aus '%s'.\n", num_json_elements, filename);
-    
+
     for(size_t i = 0; i < num_json_elements; i++) {
         // i ist die aktuelle regel
         json_t *value_json_obj = json_array_get(root, i); // Holen Sie das JSON-Objekt für die aktuelle Regel
 
-       
+        
 
         // structur in die die regel geschrieben wird
         struct firewall_rule_format new_rule;
-        memset(&new_rule, 0, sizeof(new_rule)); // Initialisiere alle Felder
-        new_rule.result_code = PARSE_SUCCESS; // Standardwert setzen
 
         // Prüfen, ob das Element ein JSON-Objekt ist (falls nicht, überspringen)
         if (!json_is_object(value_json_obj)) {
@@ -550,16 +588,18 @@ int parse_rules_json_file(const char *filename, struct rule_node **head_from_lis
             continue;
         }
 
+        new_rule.result_code = PARSE_SUCCESS;
+
         // hier wird ueberprueft ob die regel aktiviert ist
-        if (new_rule.enabled == false) {
-            printf("Die Regel %zu ist nicht aktiviert und wurde somit auch nicth geladen\n", new_rule.name);
+        if (new_rule.enabled = false) {
+            printf("Die Regel %s ist nicht aktiviert und wurde somit auch nicth geladen\n", new_rule.name);
             continue;
         }
 
         add_rule_to_list(&new_rule, head_from_list);
 
         if(new_rule.result_code == PARSE_SUCCESS) {
-            printf("Die Regel %zu wurde  hinzuegfuegt!\n", new_rule.name);
+            printf("Die Regel %s wurde  hinzuegfuegt!\n", new_rule.name);
         }
 
           
@@ -681,6 +721,99 @@ void print_rule(const firewall_rule_format *rule) {
     printf("---------------------------\n\n");
 } 
 
+void  *timer(void *arg) {
+    // Caste das void*-Argument in einen Zeiger auf die Parameter-Struktur
+    timer_args *args = (timer_args *)arg;
+    
+    // Greife auf die einzelnen Parameter über den Zeiger zu
+    thread_result *result = args->result;
+    pthread_t receiver_tid = args->receiver_thread_tid;
+
+    // Definiere die Timeout-Zeit in Sekunden
+    const int timeout_seconds = 10;
+
+    struct timeval start_time, current_time;
+    long elapsed_seconds;
+
+    // aktuelle zeit
+    gettimeofday(&start_time, NULL);
+
+    // Die Schleife wartet bis das Timeout erreicht ist
+    do {
+        gettimeofday(&current_time, NULL);
+        elapsed_seconds = current_time.tv_sec - start_time.tv_sec;
+        usleep(100000); 
+    } while (elapsed_seconds < timeout_seconds);
+
+    // Prüfen, ob das Ergebnis noch nicht gesetzt wurde
+    if (result->status == RESULT_NONE) {
+        // Der Timer hat als Erster geendet, daher setzen wir den Status auf Timeout
+        result->status = RESULT_TIMEOUT;
+        printf("Timer-Thread: Timeout erreicht. Breche Receiver ab.\n");
+        // Breche den Receiver-Thread ab, da er blockiert
+        pthread_cancel(receiver_tid);
+    }
+
+    return NULL;
+}
+
+void *recv_msg(void *arg) {
+    // Caste das void*-Argument in einen Zeiger auf die Parameter-Struktur
+    recv_args *args = (recv_args *)arg;
+    
+    // Greife auf die einzelnen Parameter über den Zeiger zu
+    thread_result *result = args->result;
+    pthread_t timer_tid = args->timer_thread_tid;
+    int nl_sock = args->nl_sock;
+
+    // hier wird das empfange packet 
+    char buffer[4096];
+    // struktur enhaelt alle informationen fuer den empfang
+    struct msghdr msg;
+    // beschreibt den buffer
+    struct iovec iov;
+
+
+    memset(&msg, 0, sizeof(msg));
+    iov.iov_base = buffer;
+    iov.iov_len = sizeof(buffer);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+
+    // hier wird auf das packet gewartet
+    ssize_t ret = recvmsg(nl_sock, &msg, 0);
+
+   
+
+    if (ret > 0) {
+        // gibt zu griff auf den header
+        struct nlmsghdr *nlh = (struct nlmsghdr *)buffer;
+        // gibt zugriff auf den payload
+        void *payload = NLMSG_DATA(nlh);
+
+        
+        // hier wird geguckt ob die empfangenen daten unbeshcaedigt sind
+        if (nlh->nlmsg_type == NL_CMD_ACK) {
+            result->status = RESULT_RECEIVED;
+            printf("Das Ack-Packet wurde erfolgreich empfangen\n");
+        } else if (nlh->nlmsg_type == NL_CMD_ERROR) {
+            result->status = RESULT_RECEIVED;
+            printf("Es gab einen Fehler beim Empfangen des Pakcets\n");
+        }
+        
+    } else {
+        printf("%d", ret);
+        perror("Fehler bei m empfangen des packets\n");
+    }
+
+    pthread_cancel(&timer_tid);
+
+    return NULL;
+
+
+
+    
+}
 
 // int nl_sock_fd ist der bereitserstellet socket
 int send_rules_to_kernel(struct rule_node **head, int nl_sock_fd, int command) {
@@ -688,6 +821,26 @@ int send_rules_to_kernel(struct rule_node **head, int nl_sock_fd, int command) {
 
     ssize_t ret;
     struct nlmsghdr *nlh = NULL;
+
+    int num_send_trys = 3;
+
+    // ides fuer die beiden threads
+    pthread_t timer_thread;
+    pthread_t recv_msg_thread;
+
+    // struktur  zur kommunikation der threads
+    thread_result result_data_thread;
+
+    // struktur fuer die timer argumente
+    timer_args timer_args;
+    timer_args.result = &result_data_thread;
+    timer_args.receiver_thread_tid = recv_msg_thread;
+
+    // struktur fuer die timer argumente
+    recv_args recv_args;
+    recv_args.result = &result_data_thread;
+    recv_args.timer_thread_tid = timer_thread;
+    recv_args.nl_sock = nl_sock_fd;
 
     while(current_rule != NULL) {
 
@@ -697,7 +850,7 @@ int send_rules_to_kernel(struct rule_node **head, int nl_sock_fd, int command) {
 
         // 1. Berechnung der Nachrichtengröße
         // NLMSG_SPACE(payload_len) berechnet den Platz für den Netlink-Header + die Payload
-        size_t msg_len = NLMSG_SPACE(sizeof(current_rule->rule));
+        size_t msg_len = NLMSG_SPACE(sizeof(struct rule_node));
 
         // 2. Speicher für die Netlink-Nachricht allozieren und initialisieren
         nlh = (struct nlmsghdr *)malloc(msg_len);
@@ -733,7 +886,7 @@ int send_rules_to_kernel(struct rule_node **head, int nl_sock_fd, int command) {
         converted_rule.rule.dst_port.end = htons(current_rule->rule.dst_port.end);
 
         // Kopiere die konvertierte Regel in den Datenbereich der Netlink-Nachricht
-        memcpy(NLMSG_DATA(nlh), &converted_rule.rule, sizeof(firewall_rule_format));
+        memcpy(NLMSG_DATA(nlh), &converted_rule, sizeof(rule_node));
 
         // 5. Zieladresse für die Netlink-Nachricht festlegen (der Kernel)
         memset(&dest_addr, 0, sizeof(dest_addr));
@@ -753,16 +906,64 @@ int send_rules_to_kernel(struct rule_node **head, int nl_sock_fd, int command) {
         msg.msg_iov = &iov; // iovec-Array
         msg.msg_iovlen = 1; // Anzahl der iovec-Elemente
 
+        int final_status = 0;
 
-        // Nachricht senden
-        ret = sendmsg(nl_sock_fd, &msg, 0);
-        if (ret < 0) {
-            printf("Es gab einen Fehler beim Senden der Nachricht %d\n", current_rule->rule.id);
-            free(nlh);
-            continue;
-        } else {
-            printf("Die Nachricht mit der Id %d wurde gesendet!\n", current_rule->rule.id);
-        }  
+        for(int i = 1; i < num_send_trys; i++) {
+            // Nachricht senden
+            ret = sendmsg(nl_sock_fd, &msg, 0);
+            if (ret < 0) {
+                printf("Es gab einen Fehler beim Senden der Nachricht %d\n", current_rule->rule.id);
+                free(nlh);
+                continue;
+            } else {
+                printf("Die Nachricht mit der Id %d wurde gesendet!\n", current_rule->rule.id);
+                
+            }  
+            
+            // starten des recv threads
+            if (pthread_create(&recv_msg_thread, NULL, recv_msg, &recv_args) != 0) {
+                perror("Fehler beim Starten vom Recv-Thread");
+                continue;
+            } else {
+                printf("Der Recv-Thread wurde gestartet\n");
+            }
+
+            // starten des timer threads
+            if (pthread_create(&timer_thread, NULL, timer, &timer_args) != 0) {
+                perror("Fehler beim Starten von Timer-Thread");
+                continue;
+            } else {
+                printf("Der Timer-Thread wurde gestartet\n");
+            }
+
+            // Warte auf die Beendigung beider Threads
+            pthread_join(timer_thread, NULL);
+            pthread_join(recv_msg_thread, NULL);
+            
+            // auslesen der status struktur
+            if (result_data_thread.status == RESULT_RECEIVED) {
+                printf(" Ergebnis: Eine ACK-Nachricht wurde erfolgreich empfangen.\n");
+                break;
+            } else if (result_data_thread.status == RESULT_TIMEOUT) {
+                printf(" Ergebnis: Timeout! Keine Nachricht wurde empfangen.\n");
+                continue;
+            } else {
+                // Dies sollte nicht passieren, da einer der beiden Threads das Ergebnis setzen sollte
+                printf(" Ergebnis: Unbekannter Status.\n");
+                printf("%d\n", result_data_thread.status);
+            }
+
+            if (i == num_send_trys) {
+                final_status = -1;
+            }
+                        
+
+        }
+
+        if (final_status != 0) {
+            printf("Es wurde Ergebnislos probiert die Regel %d an den Kernel zu senden.\n", current_rule->rule.id);
+        }
+        
 
         free(nlh); // Allozierten Speicher freigeben
 
@@ -774,8 +975,10 @@ int send_rules_to_kernel(struct rule_node **head, int nl_sock_fd, int command) {
 
 
 int main(int argc, char *argv[]) {
-   //zeigt auf das erste eleemnt der linked list
-    struct rule_node *head = NULL;
+    //zeigt auf das erste eleemnt der linked list
+    struct rule_node *head;
+
+    
 
     // 1. Prüfe, ob der Dateiname als Kommandozeilenargument übergeben wurde
     if (argc != 2) { // argc ist die Anzahl der Argumente, argv[0] ist der Programmname, argv[1] der erste Parameter
@@ -786,8 +989,6 @@ int main(int argc, char *argv[]) {
 
     // 2. Den Dateinamen aus den Kommandozeilenargumenten holen
     const char *json_filename = argv[1]; 
-
-    printf("Moin\n");
 
     // hier werden die regeln geparst und die linked list erstellt
     if (parse_rules_json_file(json_filename, &head) == 0 ) {
@@ -811,26 +1012,25 @@ int main(int argc, char *argv[]) {
     struct sockaddr_nl src_addr;
     memset(&src_addr, 0, sizeof(src_addr));
     src_addr.nl_family = AF_NETLINK;
-    src_addr.nl_pid = getpid(); // PID des aktuellen Prozesses
-    src_addr.nl_groups = 0; // Keine Multicast-Gruppe
+    src_addr.nl_pid = getpid(); // Binde an die eigene Prozess-ID
+    src_addr.nl_groups = 0;     // Keine Multicast-Gruppen
 
-    // Socket an die Adresse binden
     if (bind(nl_sock_fd, (struct sockaddr *)&src_addr, sizeof(src_addr)) < 0) {
         perror("Fehler beim Binden des Netlink-Sockets");
         close(nl_sock_fd);
         return EXIT_FAILURE;
     }
-
-    // 4. Regeln an den Kernel senden
+    printf("Netlink-Socket erfolgreich erstellt und gebunden (PID: %d).\n", getpid());
+    
     send_rules_to_kernel(&head, nl_sock_fd, NL_CMD_ADD_RULE);
 
-    // Hier kannst du weitere Befehle senden oder auf Antworten vom Kernel warten
 
-    // Netlink-Socket schließen
-    close(nl_sock_fd);
-
-    // 5. Speicher für die Regel-Linked List freigeben
     clear_list(&head);
 
-    return EXIT_SUCCESS;
 }
+
+
+
+
+
+

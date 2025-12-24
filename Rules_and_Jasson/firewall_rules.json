@@ -9,7 +9,8 @@
     "destination_ip": "ANY",
     "source_port": "ANY",
     "destination_port": "22",
-    "action": "ACCEPT"
+    "action": "ACCEPT",
+    "direction": "IN"
   },
   {
     "id": 2,
@@ -21,7 +22,8 @@
     "destination_ip": "ANY",
     "source_port": "ANY",
     "destination_port": "ANY",
-    "action": "DROP"
+    "action": "DROP",
+    "direction": "OUT"
   },
   {
     "id": 3,
@@ -33,7 +35,8 @@
     "destination_ip": "8.8.8.8",
     "source_port": "ANY",
     "destination_port": "53",
-    "action": "ACCEPT"
+    "action": "ACCEPT",
+    "direction": "OUT"
   },
   {
     "id": 4,
@@ -45,6 +48,7 @@
     "destination_ip": "ANY",
     "source_port": "ANY",
     "destination_port": "ANY",
-    "action": "DROP"
+    "action": "DROP",
+    "direction": "IN"
   }
 ]

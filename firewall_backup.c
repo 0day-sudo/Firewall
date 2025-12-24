@@ -15,11 +15,12 @@
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
-#include <linux/skbuff.h>
-#include <linux/netfilter.h>
 #include <net/ip.h> // ip_hdr
 #include <net/tcp.h> // tcp_hdr
 #include <net/udp.h> // udp_hdr
+#include <linux/jiffies.h>
+#include <linux/rhashtable.h>
+
 
 //netlink protocoll
 #define MY_FIREWALL_NETLINK_PROTOCOL 31
@@ -61,6 +62,14 @@ enum {
     // Füge weitere Befehle hinzu, wenn du sie brauchst (z.B. GET_RULES, STATUS_REPORT)
 };
 
+// Die Richtung der Regel, muss identisch zur Kernel-Definition sein
+typedef enum {
+    FW_DIR_IN = 1,  
+    FW_DIR_OUT,    
+    FW_DIR_BOTH,
+    FW_DIR_UNKWON
+} fw_direction_t;
+
 //firewallregelstruktur
 typedef struct firewall_rule_format{
     uint32_t id;
@@ -69,7 +78,7 @@ typedef struct firewall_rule_format{
     int priotity;
     int result_code; //so kann ueebrpruft werden vor dem erstellen der linked list ob die struktur gueltig ist
 
-    fw_protocol_t protocoll;
+    fw_protocol_t protocol;
 
     uint32_t src_ip;    // Host Byte Order
     uint32_t src_mask;  // Host Byte Order
@@ -80,6 +89,8 @@ typedef struct firewall_rule_format{
     fw_port_range_t dst_port; // Host Byte Order
 
     fw_action_t action;
+
+    fw_direction_t direction;
 } firewall_rule_format;
 
 //linked list
@@ -88,6 +99,14 @@ typedef struct rule_node {
     struct list_head list;
 } rule_node;
 
+// verschiedene arten von ack packet antworten
+typedef enum fw_received_t {
+    NL_CMD_ACK = 10,
+    NL_CMD_ERROR = 11,
+    NL_CMD_RAE = 12 //steht fuer rule alredy exists
+};
+
+
 // alle globalen variablen
 static struct sock *nl_sk = NULL; // Hier wird dein Netlink-Socket-Objekt gespeichert
 static LIST_HEAD(firewall_rules_list); // Der Kopf deiner Kernel-Linked-List
@@ -95,32 +114,91 @@ static DEFINE_MUTEX(firewall_rules_mutex); // Mutex zum Schutz der Liste
 static struct nf_hook_ops my_hook_ops; // die hook struktur zum definieren des hooks
 
 // funktionen
-static void netlink_recv_message(struct sk_buff *skb);
-static void send_netlink_ack();
+void netlink_recv_message(struct sk_buff *skb);
+//static void send_netlink_ack(int pid, int type, int result);
 static void clear_list(void);
-static int firewall_add_rule(struct firewall_rule_format *received_rule);
-static unsigned int my_hook_func(void *priv, struct sk_buff *skb, const struct nf_hook_state *state);
+enum fw_received_t firewall_add_rule(struct firewall_rule_format *received_rule);
+static unsigned int firewall_in_hook(void *priv, struct sk_buff *skb, const struct nf_hook_state *state);
+static unsigned int firewall_out_hook(void *priv, struct sk_buff *skb, const struct nf_hook_state *state);
 
 
+static void send_netlink_ack(int pid, int type, int result) {
+    struct sk_buff *skb_out;
+    struct nlmsghdr *nlh;
+    void *payload_data;
+    int payload_len = sizeof(int);
+    int res;
+
+    mutex_lock(&firewall_rules_mutex);
+
+    skb_out = nlmsg_new(payload_len, 0);
+    if (!skb_out) {
+        printk(KERN_ERR "Firewall: Fehler bei der Erstellung des sk_buffs.\n");
+        mutex_unlock(&firewall_rules_mutex);
+        return;
+    }
+
+    nlh = nlmsg_put(skb_out, 0, 0, type, payload_len, 0);
+    if (!nlh) {
+        nlmsg_free(skb_out);
+        printk(KERN_ERR "Firewall: nlmsg_put fehlgeschlagen.\n");
+        mutex_unlock(&firewall_rules_mutex);
+        return;
+    }
+
+    payload_data = nlmsg_data(nlh);
+    memcpy(payload_data, &result, payload_len);
+
+    res = netlink_unicast(nl_sk, skb_out, pid, MSG_DONTWAIT);
+    if (res < 0) {
+        printk(KERN_ERR "Firewall: netlink_unicast fehlgeschlagen (Fehler: %d).\n", res);
+    } else {
+        printk(KERN_INFO "Firewall: Netlink-Antwort an PID %d gesendet (Typ: %d, Result: %d).\n", pid, type, result);
+    }
+
+    mutex_unlock(&firewall_rules_mutex);
+}
+
+#define HOOK_PRIORITY NF_IP_PRI_FIRST
+
+// Hook 1: Eingehender Verkehr (NF_INET_LOCAL_IN)
+static struct nf_hook_ops in_hook_ops = {
+    .hook     = firewall_in_hook, 
+    .pf       = NFPROTO_IPV4,
+    .hooknum  = NF_INET_LOCAL_IN,
+    .priority = HOOK_PRIORITY,
+};
+
+// Hook 2: Ausgehender Verkehr (NF_INET_LOCAL_OUT)
+static struct nf_hook_ops out_hook_ops = {
+    .hook     = firewall_out_hook, 
+    .pf       = NFPROTO_IPV4,
+    .hooknum  = NF_INET_LOCAL_OUT,
+    .priority = HOOK_PRIORITY,
+};
 
 static int __init init_firewall(void) {
     printk("Die Firewall-Module wurde erfolgreich geladen\n");
-    // regestrieren von hook in init funktion
-    my_hook_ops.hook = my_hook_func;
-    my_hook_ops.hooknum = NF_INET_LOCAL_IN;
-    my_hook_ops.pf = NFPROTO_IPV4;
-    my_hook_ops.priority = NF_IP_PRI_FIRST;
 
-    // funktion zum regestriefen des hooks
-    int ret = nf_register_net_hook(&init_net, &my_hook_ops);
+    // registrierung des In Hooks
+    int ret_in = nf_register_net_hook(&init_net, &in_hook_ops);
 
-    if (ret < 0) {
-        printk(KERN_ERR "Fehler beim Registrieren des Netfilter-Hooks: %d\n", ret);
-        return ret;
+    if (ret_in < 0) {
+        printk(KERN_ERR "Fehler beim Registrieren des Netfilter-Hooks: %d\n", ret_in);
+        return ret_in;
     } else {
         printk(KERN_INFO "Netfilter-Hook erfolgreich registriert.\n");
     }
 
+    // regestrierung des Out Hooks
+    int ret_out = nf_register_net_hook(&init_net, &out_hook_ops);
+
+    if (ret_out < 0) {
+        printk(KERN_ERR "Fehler beim Registrieren des Netfilter-Hooks: %d\n", ret_out);
+        return ret_out;
+    } else {
+        printk(KERN_INFO "Netfilter-Hook erfolgreich registriert.\n");
+    }
     
 
     // zu weisung der callback funktion
@@ -154,7 +232,8 @@ static void __exit exit_firewall(void) {
 
     clear_list();
 
-    nf_unregister_net_hook(&init_net, &my_hook_ops);
+    nf_unregister_net_hook(&init_net, &in_hook_ops);
+    nf_unregister_net_hook(&init_net, &out_hook_ops);
 
     printk(KERN_INFO "Firewall: Alle Regeln gelöscht. Goodby kernel.\n");
 
@@ -202,6 +281,17 @@ void netlink_recv_message(struct sk_buff *skb) {
             received_rule = (firewall_rule_format *)nlmsg_data(nlh);
 
             int ret = firewall_add_rule(received_rule);
+
+            if (ret == NL_CMD_ACK) {
+                send_netlink_ack(pid, NL_CMD_ACK, -EINVAL);
+            } else if (ret == NL_CMD_RAE) {
+                send_netlink_ack(pid, NL_CMD_RAE, -EINVAL);
+            } else {
+                send_netlink_ack(pid, NL_CMD_ERROR, -EINVAL);
+            }
+            
+
+            
             break;
 
         case NL_CMD_DELETE_RULE:
@@ -217,7 +307,44 @@ void netlink_recv_message(struct sk_buff *skb) {
     }
 }
 
-static int firewall_add_rule(struct firewall_rule_format *received_rule) {
+// sk_buff ist der Socket Buffer und beshcreibt das einzelne Packet
+
+enum fw_received_t firewall_add_rule(struct firewall_rule_format *received_rule) {
+
+    // Schütze die Liste mit einem Mutex, bevor du sie änderst
+    mutex_lock(&firewall_rules_mutex);
+
+    struct rule_node *rule_entry;
+
+    // Iteriere über alle vorhandenen Regeln
+    list_for_each_entry(rule_entry, &firewall_rules_list, list) {
+        
+        // --- Duplikat-Prüfung ---
+        // Vergleiche alle Felder, die eine Regel definieren.
+        // Die Regel-ID (id) und der Name (name) werden NICHT verglichen,
+        // da zwei identische Regeln unterschiedliche IDs/Namen haben könnten, aber logisch gleich sind.
+
+        if (rule_entry->rule.protocol == received_rule->protocol &&
+            rule_entry->rule.src_ip == received_rule->src_ip &&
+            rule_entry->rule.src_mask == received_rule->src_mask &&
+            rule_entry->rule.dst_ip == received_rule->dst_ip &&
+            rule_entry->rule.dst_mask == received_rule->dst_mask &&
+            rule_entry->rule.src_port.start == received_rule->src_port.start &&
+            rule_entry->rule.src_port.end == received_rule->src_port.end &&
+            rule_entry->rule.dst_port.start == received_rule->dst_port.start &&
+            rule_entry->rule.dst_port.end == received_rule->dst_port.end &&
+            rule_entry->rule.action == received_rule->action &&
+            rule_entry->rule.direction == received_rule->direction &&
+            rule_entry->rule.enabled == received_rule->enabled &&
+            rule_entry->rule.priotity == received_rule->priotity) {
+            // Duplikat gefunden!
+            printk(KERN_WARNING "Firewall: Duplikat-Regel (ID %u) versucht hinzuzufügen. Abgelehnt.\n", received_rule->id);
+            mutex_unlock(&firewall_rules_mutex);
+            return NL_CMD_RAE;
+        }
+
+    }
+
     // neu allocalierte struktur
     struct rule_node *new_node = kmalloc(sizeof(rule_node), GFP_KERNEL);
 
@@ -229,18 +356,16 @@ static int firewall_add_rule(struct firewall_rule_format *received_rule) {
     // hier wird die in die neu erstellte regel die empfangene regel rienkopiert
     memcpy(&new_node->rule, received_rule, sizeof(firewall_rule_format));
 
-    // Schütze die Liste mit einem Mutex, bevor du sie änderst
-    mutex_lock(&firewall_rules_mutex);
+    
     list_add_tail(&new_node->list, &firewall_rules_list);
     mutex_unlock(&firewall_rules_mutex);
 
     printk(KERN_INFO "Firewall: Regel mit ID %u erfolgreich hinzugefügt.\n", new_node->rule.id);
-    return 0; // Erfolg
-
+    return NL_CMD_ACK; // Erfolg
 
 }
 
-static unsigned int my_hook_func(void *priv, struct sk_buff *skb, const struct nf_hook_state *state) {
+static unsigned int firewall_out_hook(void *priv, struct sk_buff *skb, const struct nf_hook_state *state) {
     struct iphdr *iph;
     struct rule_node *rule_entry;
 
@@ -254,7 +379,112 @@ static unsigned int my_hook_func(void *priv, struct sk_buff *skb, const struct n
     // zugriff auf linked lists erlauben
     mutex_lock(&firewall_rules_mutex);
 
-    list_for_each_entry(rule_entry, &fireall_rules_list, list) {
+    list_for_each_entry(rule_entry, &firewall_rules_list, list) {
+        // richtige Richtung herausfitern
+        if (rule_entry->rule.direction != FW_DIR_OUT) {
+            continue;
+        }
+
+
+        // 1. Protokoll vergleichen
+        // FW_PROTO_ANY bedeutet, dass das Protokoll keine Rolle spielt
+        if (rule_entry->rule.protocol != FW_PROTO_ANY &&
+            rule_entry->rule.protocol != iph->protocol) {
+            continue; // Protokoll passt nicht, gehe zur nächsten Regel
+        }
+
+        // 2. IP-Adressen und Masken vergleichen
+        // 'src_ip' ist in Host-Byte-Order, 'iph->saddr' in Network-Byte-Order.
+        // Wir müssen die IP-Header-Adresse in die Host-Byte-Order umwandeln, um sie zu vergleichen.
+        if (rule_entry->rule.src_mask != 0) {
+            if ((ntohl(iph->saddr) & rule_entry->rule.src_mask) != 
+                (rule_entry->rule.src_ip & rule_entry->rule.src_mask)) {
+                continue; // Quell-IP passt nicht
+            }
+        }
+        
+        if (rule_entry->rule.dst_mask != 0) {
+            if ((ntohl(iph->daddr) & rule_entry->rule.dst_mask) != 
+                (rule_entry->rule.dst_ip & rule_entry->rule.dst_mask)) {
+                continue; // Ziel-IP passt nicht
+            }
+        }
+
+        // 3. Ports vergleichen
+        // Die Port-Logik sollte nur für TCP/UDP-Pakete angewendet werden
+        if (iph->protocol == IPPROTO_TCP || iph->protocol == IPPROTO_UDP) {
+            
+            __be16 src_port_network, dst_port_network;
+
+            if (iph->protocol == IPPROTO_TCP) {
+                struct tcphdr *tcph = tcp_hdr(skb);
+                src_port_network = tcph->source;
+                dst_port_network = tcph->dest;
+            } else { // UDP
+                struct udphdr *udph = udp_hdr(skb);
+                src_port_network = udph->source;
+                dst_port_network = udph->dest;
+            }
+
+            // Überprüfe den Quellportbereich
+            if (ntohs(src_port_network) < rule_entry->rule.src_port.start ||
+                ntohs(src_port_network) > rule_entry->rule.src_port.end) {
+                continue; // Quellport passt nicht
+            }
+
+            // Überprüfe den Zielportbereich
+            if (ntohs(dst_port_network) < rule_entry->rule.dst_port.start ||
+                ntohs(dst_port_network) > rule_entry->rule.dst_port.end) {
+                continue; // Zielport passt nicht
+            }
+
+            
+        }
+
+        printk(KERN_INFO "Firewall: Paket passt zu Regel ID %u.\n", rule_entry->rule.id);
+
+        // Führe die Aktion der Regel aus und verlasse die Funktion
+        if (rule_entry->rule.action == FW_ACTION_ACCEPT) {
+            mutex_unlock(&firewall_rules_mutex);
+            return NF_ACCEPT;
+        } else if (rule_entry->rule.action == FW_ACTION_DROP || rule_entry->rule.action == FW_ACTION_REJECT) {
+            // REJECT ist hier nicht implementiert, verhält sich wie DROP
+            mutex_unlock(&firewall_rules_mutex);
+            return NF_DROP;
+        }
+
+    }       
+
+    // Wenn die Schleife endet, wurde keine passende Regel gefunden.
+    mutex_unlock(&firewall_rules_mutex);
+    
+    // Die Standard-Aktion für nicht-passende Pakete
+    return NF_ACCEPT;
+}
+
+
+
+static unsigned int firewall_in_hook(void *priv, struct sk_buff *skb, const struct nf_hook_state *state) {
+    struct iphdr *iph;
+    struct rule_node *rule_entry;
+
+    // Pakete, die nicht für uns sind oder kein IP-Header haben, akzeptieren wir
+    if (!skb || !ip_hdr(skb)) {
+        return NF_ACCEPT;
+    }
+
+    iph = ip_hdr(skb);
+
+    // zugriff auf linked lists erlauben
+    mutex_lock(&firewall_rules_mutex);
+
+    list_for_each_entry(rule_entry, &firewall_rules_list, list) {
+        // richtige Richtung herausfitern
+        if (rule_entry->rule.direction != FW_DIR_IN) {
+            continue;
+        }
+
+
         // 1. Protokoll vergleichen
         // FW_PROTO_ANY bedeutet, dass das Protokoll keine Rolle spielt
         if (rule_entry->rule.protocol != FW_PROTO_ANY &&
@@ -313,12 +543,12 @@ static unsigned int my_hook_func(void *priv, struct sk_buff *skb, const struct n
             if (rule_entry->rule.action == FW_ACTION_ACCEPT) {
                 mutex_unlock(&firewall_rules_mutex);
                 return NF_ACCEPT;
-            } else if (rule_entry->rule.action == FW_ACTION_DROP ||
-                    rule_entry->rule.action == FW_ACTION_REJECT) {
+            } else if (rule_entry->rule.action == FW_ACTION_DROP || rule_entry->rule.action == FW_ACTION_REJECT) {
                 // REJECT ist hier nicht implementiert, verhält sich wie DROP
                 mutex_unlock(&firewall_rules_mutex);
                 return NF_DROP;
             }
+        }
     }
 
     // Wenn die Schleife endet, wurde keine passende Regel gefunden.
@@ -329,42 +559,7 @@ static unsigned int my_hook_func(void *priv, struct sk_buff *skb, const struct n
 
 }
 
-static void send_netlink_ack(int pid, int type, int result) {
-    struct sk_buff *skb_out;
-    struct nlmsghdr *nlh;
-    void *payload_data;
-    int payload_len = sizeof(int);
-    int res;
 
-    mutex_lock(&firewall_rules_mutex);
-
-    skb_out = nlmsg_new(payload_len, 0);
-    if (!skb_out) {
-        printk(KERN_ERR "Firewall: Fehler bei der Erstellung des sk_buffs.\n");
-        mutex_unlock(&firewall_rules_mutex);
-        return;
-    }
-
-    nlh = nlmsg_put(skb_out, 0, 0, type, payload_len, 0);
-    if (!nlh) {
-        nlmsg_free(skb_out);
-        printk(KERN_ERR "Firewall: nlmsg_put fehlgeschlagen.\n");
-        mutex_unlock(&firewall_rules_mutex);
-        return;
-    }
-
-    payload_data = nlmsg_data(nlh);
-    memcpy(payload_data, &result, payload_len);
-
-    res = netlink_unicast(nl_sk, skb_out, pid, MSG_DONTWAIT);
-    if (res < 0) {
-        printk(KERN_ERR "Firewall: netlink_unicast fehlgeschlagen (Fehler: %d).\n", res);
-    } else {
-        printk(KERN_INFO "Firewall: Netlink-Antwort an PID %d gesendet (Typ: %d, Result: %d).\n", pid, type, result);
-    }
-
-    mutex_unlock(&firewall_rules_mutex);
-}
 
 module_init(init_firewall);
 module_exit(exit_firewall);

@@ -12,6 +12,8 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <sys/time.h>
+#include <unistd.h>
+#include <stdatomic.h>
 
 
 #define MY_FIREWALL_NETLINK_PROTOCOL 31
@@ -41,6 +43,14 @@ typedef enum {
     FW_ACTION_UNKWON
 } fw_action_t;
 
+// Die Richtung der Regel, muss identisch zur Kernel-Definition sein
+typedef enum {
+    FW_DIR_IN = 1,  
+    FW_DIR_OUT,    
+    FW_DIR_BOTH,
+    FW_DIR_UNKWON
+} fw_direction_t;
+
 //firewallregelstruktur
 typedef struct firewall_rule_format{
     uint32_t id;
@@ -60,6 +70,8 @@ typedef struct firewall_rule_format{
     fw_port_range_t dst_port; // Host Byte Order
 
     fw_action_t action;
+
+    fw_direction_t diection;
 } firewall_rule_format;
 
 //linked list
@@ -92,7 +104,8 @@ typedef struct {
 // struktur zur ueebrgabe der argumente die die timer funktion braucht
 typedef struct {
     thread_result *result;
-    pthread_t receiver_thread_id;
+    pthread_t receiver_thread_tid;
+    atomic_bool *exit_thread;
 } timer_args;
 
 // struktur zur ueebrgabe der argumente die die recv funktion braucht
@@ -100,12 +113,14 @@ typedef struct {
     thread_result *result;
     pthread_t timer_thread_tid;
     int nl_sock;
+    atomic_bool *exit_thread;
 } recv_args;
 
 // verschiedene arten von ack packet antworten
 enum {
     NL_CMD_ACK = 10,
-    NL_CMD_ERROR = 11
+    NL_CMD_ERROR = 11,
+    NL_CMD_RAE = 12 // stet fuer rule already exists
 };
 
 void add_rule_to_list(struct firewall_rule_format *rule_data, struct rule_node **head_from_list) {
@@ -262,14 +277,6 @@ int change_IpString_into_32BitInteger(const char *ip_cidr_str, uint32_t *ip, uin
     char *token;
     char *rest = str_copy; // Pointer für strtok_r
 
-    // Prüfen auf "ANY"
-    if (strcmp(ip_cidr_str, "ANY") == 0) {
-        *ip = 0;       // 0.0.0.0
-        *mask = 0;     // 0.0.0.0
-        free(str_copy);
-        return 0;
-    }
-
     // IP-Adresse extrahieren
     token = strtok_r(rest, "/", &rest);
     if (!token) {
@@ -346,6 +353,18 @@ int parse_port_range_string_and_change_into_bytes(const char *port_str, fw_port_
     return 0;
 }
 
+// Hilfsfunktion zur Konvertierung des Strings in den Enum-Wert
+fw_direction_t get_direction_from_string(const char *dir_str) {
+    if (strcmp(dir_str, "IN") == 0) {
+        return FW_DIR_IN;
+    } else if (strcmp(dir_str, "OUT") == 0) {
+        return FW_DIR_OUT;
+    } else if (strcmp(dir_str, "BOTH") == 0) {
+        return FW_DIR_BOTH;
+    }
+    return FW_DIR_UNKWON;
+}
+
 // alle moeglichen fehler die beim parsen passieren koennen
 #define PARSE_SUCCESS           0
 #define ERROR_INVALID_ID        -1
@@ -358,13 +377,14 @@ int parse_port_range_string_and_change_into_bytes(const char *port_str, fw_port_
 #define ERROR_INVALID_SRC_PORT  -8
 #define ERROR_INVALID_DST_PORT  -9
 #define ERROR_INVALID_ACTION    -10
+#define ERROR_INVALID_DIRECTION -11
 
 // Fehlerfunktion wenn etwas beim Parsen schief geht
 void error_function(struct firewall_rule_format *new_rule, struct rule_node **head_from_list, int i) {
     // Füge die Regel (auch wenn fehlerhaft) zur Liste hinzu, um alle Parsingergebnisse zu verfolgen.
         if (new_rule->result_code != PARSE_SUCCESS) {
             add_rule_to_list(new_rule, head_from_list);
-            printf("Regel %zu (ID: %u) wurde mit Fehlern geparst erfolgreich hinzugefügt.\n", i, new_rule->id);
+            printf("Regel %d (ID: %u) wurde mit Fehlern geparst erfolgreich hinzugefügt.\n", i, new_rule->id);
 
             // hier wird der genaue Fehelr identifiziert
             switch (new_rule->result_code) {
@@ -398,13 +418,16 @@ void error_function(struct firewall_rule_format *new_rule, struct rule_node **he
             case ERROR_INVALID_ACTION:
                 fprintf(stderr, "Ungültige oder unbekannte Aktion.\n");
                 break;
+            case ERROR_INVALID_DIRECTION:
+                fprintf(stderr, "Ungültige oder unbekannte Deriction.\n");
+                break;
             default:
                 fprintf(stderr, "Unbekannter Parsing-Fehler (Code: %d).\n", new_rule->result_code);
                 break;
             }
 
         } else {
-            fprintf(stderr, "Regel %zu (ID: %u, wenn verfügbar) konnte nicht geparst werden und konnte nicht zur liste hinzugefuegt werden\n", i, new_rule->id);
+            fprintf(stderr, "Regel %d (ID: %u, wenn verfügbar) konnte nicht geparst werden und konnte nicht zur liste hinzugefuegt werden\n", i, new_rule->id);
         }
 }
 
@@ -419,7 +442,7 @@ int parse_rules_json_file(const char *filename, struct rule_node **head_from_lis
     if (!root) {
         fprintf(stderr, "Fehler beim Laden der JSON-Datei '%s': %s (Zeile %d, Spalte %d)\n",
                 filename, error.text, error.line, error.column);
-        return NULL; // NULL bei Dateifehler zurückgeben
+        return 0; // NULL bei Dateifehler zurückgeben
     }
 
 
@@ -427,7 +450,7 @@ int parse_rules_json_file(const char *filename, struct rule_node **head_from_lis
     if (!json_is_array(root)) {
         fprintf(stderr, "Fehler: Das Root-Element der JSON-Datei ist kein Array.\n");
         json_decref(root); // JSON-Objekt freigeben
-        return NULL; // NULL zurückgeben, wenn es kein Array ist
+        return 0; // NULL zurückgeben, wenn es kein Array ist
     }
 
     // Anzahl der Regeln im Array ermitteln
@@ -555,7 +578,7 @@ int parse_rules_json_file(const char *filename, struct rule_node **head_from_lis
         if (json_is_string(dst_port_json)) {
             if (parse_port_range_string_and_change_into_bytes(json_string_value(dst_port_json), &new_rule.dst_port) != 0) {
                 fprintf(stderr, "Fehler bei Regel %zu: Ungültige 'destination_port'. Regel wird als fehlerhaft markiert.\n", i);
-                error_function(&new_rule, *head_from_list, i);
+                error_function(&new_rule, head_from_list, i);
             }
         } else {
             fprintf(stderr, "Fehler bei Regel %zu: 'destination_port' fehlt oder ist kein String. Regel wird als fehlerhaft markiert.\n", i);
@@ -579,18 +602,33 @@ int parse_rules_json_file(const char *filename, struct rule_node **head_from_lis
             continue;
         }
 
+        // parsen der Packetrichtung
+        json_t *direction = json_object_get(value_json_obj, "direction");
+        if (json_is_string(direction)) {
+
+            // den C-String aus dem JSON-Objekt extrahieren
+            const char *direction_str = json_string_value(direction);
+
+            new_rule.diection = get_direction_from_string(direction_str);
+
+        } else {
+            fprintf(stderr, "Fehler bei Regel %zu: 'direction' fehlt oder ist kein String. Regel wird als fehlerhaft markiert.\n", i);
+            new_rule.result_code = ERROR_INVALID_DIRECTION;
+            error_function(&new_rule, head_from_list, i);
+        }
+
         new_rule.result_code = PARSE_SUCCESS;
 
         // hier wird ueberprueft ob die regel aktiviert ist
         if (new_rule.enabled = false) {
-            printf("Die Regel %zu ist nicht aktiviert und wurde somit auch nicth geladen\n", new_rule.name);
+            printf("Die Regel %s ist nicht aktiviert und wurde somit auch nicth geladen\n", new_rule.name);
             continue;
         }
 
         add_rule_to_list(&new_rule, head_from_list);
 
         if(new_rule.result_code == PARSE_SUCCESS) {
-            printf("Die Regel %zu wurde  hinzuegfuegt!\n", new_rule.name);
+            printf("Die Regel %s wurde  hinzuegfuegt!\n", new_rule.name);
         }
 
           
@@ -601,6 +639,21 @@ int parse_rules_json_file(const char *filename, struct rule_node **head_from_lis
 
 
 
+}
+
+// Hilfsfunktion zur Konvertierung des Richtungs-Enums in einen String
+const char* get_direction_string(fw_direction_t dir) {
+    switch (dir) {
+        case FW_DIR_IN:
+            return "IN (Eingehend)";
+        case FW_DIR_OUT:
+            return "OUT (Ausgehend)";
+        case FW_DIR_BOTH:
+            return "BOTH (Beide)";
+        case FW_DIR_UNKWON:
+        default:
+            return "UNBEKANNT";
+    }
 }
 
 // Funktion zum Ausdrucken einer einzelnen Firewall-Regel
@@ -656,7 +709,7 @@ void print_rule(const firewall_rule_format *rule) {
     printf("  Enabled: %s\n", rule->enabled ? "True" : "False");
     printf("  Priority: %d\n", rule->priotity);
 
-    // PROTOKOLL-AUSGABE KORRIGIERT
+    // PROTOKOLL-AUSGABE
     const char* protocol_str;
     switch (rule->protocoll) {
         case FW_PROTO_TCP: protocol_str = "TCP"; break;
@@ -701,6 +754,10 @@ void print_rule(const firewall_rule_format *rule) {
     }
     printf("  Action: %s\n", action_str); // Jetzt korrekt einen String ausgeben
 
+    // ausgabe der Direction
+    const char *direction_string = get_direction_string(rule->diection);
+    printf("  Direction: %s\n", direction_string);
+
     // PARSING STATUS KORRIGIERT
     char status_buffer[64]; // Genug Platz für den String
     if (rule->result_code == PARSE_SUCCESS) {
@@ -718,7 +775,8 @@ void  *timer(void *arg) {
     
     // Greife auf die einzelnen Parameter über den Zeiger zu
     thread_result *result = args->result;
-    pthread_t receiver_tid = args->receiver_thread_id;
+    pthread_t receiver_tid = args->receiver_thread_tid;
+    atomic_bool *exit_thread = args->exit_thread;
 
     // Definiere die Timeout-Zeit in Sekunden
     const int timeout_seconds = 10;
@@ -731,10 +789,22 @@ void  *timer(void *arg) {
 
     // Die Schleife wartet bis das Timeout erreicht ist
     do {
+
+#if 0
+        // ueberpruefung der should exit flag
+        pthread_mutex_lock(&result->mutex);
+        if (result->should_timer_exit == true) {
+            // Signal vom Receiver erhalten -> Timer stoppt
+            pthread_mutex_unlock(&result->mutex);
+            printf("Timer: Receiver war erfolgreich. Kooperatives Beenden.\n");
+            return NULL; // SAUBERER AUSSTIEG
+        }
+        pthread_mutex_unlock(&result->mutex);
+# endif
         gettimeofday(&current_time, NULL);
         elapsed_seconds = current_time.tv_sec - start_time.tv_sec;
         usleep(100000); 
-    } while (elapsed_seconds < timeout_seconds);
+    } while (elapsed_seconds < timeout_seconds && atomic_load(exit_thread) == false);
 
     // Prüfen, ob das Ergebnis noch nicht gesetzt wurde
     if (result->status == RESULT_NONE) {
@@ -756,6 +826,7 @@ void *recv_msg(void *arg) {
     thread_result *result = args->result;
     pthread_t timer_tid = args->timer_thread_tid;
     int nl_sock = args->nl_sock;
+    atomic_bool *exit_thread = args->exit_thread;
 
     // hier wird das empfange packet 
     char buffer[4096];
@@ -774,27 +845,34 @@ void *recv_msg(void *arg) {
     // hier wird auf das packet gewartet
     ssize_t ret = recvmsg(nl_sock, &msg, 0);
 
+   
+
     if (ret > 0) {
         // gibt zu griff auf den header
         struct nlmsghdr *nlh = (struct nlmsghdr *)buffer;
         // gibt zugriff auf den payload
         void *payload = NLMSG_DATA(nlh);
-
-        if (result->status == RESULT_NONE) {
-            // hier wird geguckt ob die empfangenen daten unbeshcaedigt sind
-            if (nlh->nlmsg_type == NL_CMD_ACK) {
-                result->status = RESULT_RECEIVED;
-                printf("Das Ack-Packet wurde erfolgreich empfangen"\n);
-            } else if (nlh->nlmsg_type == NL_CMD_ERROR) {
-                result->status = RESULT_RECEIVED;
-                printf("Es gab einen Fehler beim Empfangen des Pakcets\n");
-            }
-        }
-
         
+        // hier wird geguckt ob die empfangenen daten unbeshcaedigt sind
+        if (nlh->nlmsg_type == NL_CMD_ACK) {
+            result->status = RESULT_RECEIVED;
+            printf("Das Ack-Packet wurde erfolgreich empfangen\n");
+        } else if (nlh->nlmsg_type == NL_CMD_ERROR) {
+            result->status = RESULT_RECEIVED;
+            printf("Es gab einen Fehler beim Empfangen des Pakcets\n");
+        } else if (nlh->nlmsg_type == NL_CMD_RAE) {
+            result->status = RESULT_RECEIVED;
+            printf("Die Gesendete Regel wurde schon einmal gesendet\n");
+        }
+        
+        
+    } else {
+        printf("%zd", ret);
+        perror("Fehler bei m empfangen des packets\n");
     }
-
-    pthread_cancel(&timer_tid);
+    printf("Hallo\n");
+    atomic_store(exit_thread, true);
+    printf("Moin\n");
 
     return NULL;
 
@@ -819,15 +897,21 @@ int send_rules_to_kernel(struct rule_node **head, int nl_sock_fd, int command) {
     // struktur  zur kommunikation der threads
     thread_result result_data_thread;
 
+    // Die Flagge, die von Threads sicher gelesen/geschrieben werden kann
+    atomic_bool exit_thread = ATOMIC_VAR_INIT(false);
+
     // struktur fuer die timer argumente
     timer_args timer_args;
     timer_args.result = &result_data_thread;
-    timer_args.receiver_tid = recv_msg_thread;
+    timer_args.receiver_thread_tid = recv_msg_thread;
+    timer_args.exit_thread = &exit_thread;
 
     // struktur fuer die timer argumente
     recv_args recv_args;
     recv_args.result = &result_data_thread;
-    recv_args.timer_tid = timer_thread;
+    recv_args.timer_thread_tid = timer_thread;
+    recv_args.nl_sock = nl_sock_fd;
+    recv_args.exit_thread = &exit_thread;
 
     while(current_rule != NULL) {
 
@@ -837,7 +921,7 @@ int send_rules_to_kernel(struct rule_node **head, int nl_sock_fd, int command) {
 
         // 1. Berechnung der Nachrichtengröße
         // NLMSG_SPACE(payload_len) berechnet den Platz für den Netlink-Header + die Payload
-        size_t msg_len = NLMSG_SPACE(sizeof(current_rule->rule));
+        size_t msg_len = NLMSG_SPACE(sizeof(struct rule_node));
 
         // 2. Speicher für die Netlink-Nachricht allozieren und initialisieren
         nlh = (struct nlmsghdr *)malloc(msg_len);
@@ -893,6 +977,8 @@ int send_rules_to_kernel(struct rule_node **head, int nl_sock_fd, int command) {
         msg.msg_iov = &iov; // iovec-Array
         msg.msg_iovlen = 1; // Anzahl der iovec-Elemente
 
+        int final_status = 0;
+
         for(int i = 1; i < num_send_trys; i++) {
             // Nachricht senden
             ret = sendmsg(nl_sock_fd, &msg, 0);
@@ -902,24 +988,31 @@ int send_rules_to_kernel(struct rule_node **head, int nl_sock_fd, int command) {
                 continue;
             } else {
                 printf("Die Nachricht mit der Id %d wurde gesendet!\n", current_rule->rule.id);
+                
             }  
 
-            // starten des recv threads
-            if (pthread_create(&recv_msg_thread, NULL, recv_msg, &recv_args) != 0) {
-                perror("Fehler beim Starten vom Recv-Thread");
-                continue;
-            }
 
             // starten des timer threads
             if (pthread_create(&timer_thread, NULL, timer, &timer_args) != 0) {
                 perror("Fehler beim Starten von Timer-Thread");
                 continue;
+            } else {
+                printf("Der Timer-Thread wurde gestartet\n");
             }
 
-            // Warte auf die Beendigung beider Threads
+            // starten des recv threads
+            if (pthread_create(&recv_msg_thread, NULL, recv_msg, &recv_args) != 0) {
+                perror("Fehler beim Starten vom Recv-Thread");
+                continue;
+            } else {
+                printf("Der Recv-Thread wurde gestartet\n");
+            }
+
+            //usleep(500000);
+
             pthread_join(timer_thread, NULL);
             pthread_join(recv_msg_thread, NULL);
-
+            
             // auslesen der status struktur
             if (result_data_thread.status == RESULT_RECEIVED) {
                 printf(" Ergebnis: Eine ACK-Nachricht wurde erfolgreich empfangen.\n");
@@ -930,15 +1023,20 @@ int send_rules_to_kernel(struct rule_node **head, int nl_sock_fd, int command) {
             } else {
                 // Dies sollte nicht passieren, da einer der beiden Threads das Ergebnis setzen sollte
                 printf(" Ergebnis: Unbekannter Status.\n");
+                printf("%d\n", result_data_thread.status);
+            }
+
+            if (i == num_send_trys) {
+                final_status = -1;
             }
                         
 
         }
 
-        if (i == num_send_trys) {
-            printf("Es wurde Ergebnis los probiert die Regeln an den Kernel zu senden.\n");
+        if (final_status != 0) {
+            printf("Es wurde Ergebnislos probiert die Regel %d an den Kernel zu senden.\n", current_rule->rule.id);
         }
-        
+        printf("Hallo\n");
 
         free(nlh); // Allozierten Speicher freigeben
 
@@ -950,8 +1048,10 @@ int send_rules_to_kernel(struct rule_node **head, int nl_sock_fd, int command) {
 
 
 int main(int argc, char *argv[]) {
-   //zeigt auf das erste eleemnt der linked list
+    //zeigt auf das erste eleemnt der linked list
     struct rule_node *head;
+
+    
 
     // 1. Prüfe, ob der Dateiname als Kommandozeilenargument übergeben wurde
     if (argc != 2) { // argc ist die Anzahl der Argumente, argv[0] ist der Programmname, argv[1] der erste Parameter
@@ -994,13 +1094,12 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
     printf("Netlink-Socket erfolgreich erstellt und gebunden (PID: %d).\n", getpid());
-
+    
     send_rules_to_kernel(&head, nl_sock_fd, NL_CMD_ADD_RULE);
 
 
     clear_list(&head);
-    
-    
+
 }
 
 
